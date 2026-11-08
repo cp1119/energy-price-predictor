@@ -1,0 +1,292 @@
+<title>Day-Ahead Price Predictor</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: single reading column (~720px) with wide "bench" panels for interactive figures */
+:root{
+  --bg:#f5f7f6; --panel:#ffffff; --fg:#17201d; --muted:#5b6964; --line:#d6dedb;
+  --accent:#0f7b6c; --warm:#c8641e; --wind:#3a7bd5; --solar:#e0a800; --neg:#b3261e;
+  --display:"Fraunces",Georgia,serif; --body:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#111816; --panel:#18211e; --fg:#e4ece9; --muted:#93a39d; --line:#2c3935;
+  --accent:#3cc2ad; --warm:#f0904a; --wind:#6ea3f0; --solar:#f2c94c; --neg:#ff7a70; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#111816; --panel:#18211e; --fg:#e4ece9; --muted:#93a39d; --line:#2c3935;
+  --accent:#3cc2ad; --warm:#f0904a; --wind:#6ea3f0; --solar:#f2c94c; --neg:#ff7a70; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:16px/1.65 var(--body);
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:32px 80px}
+main{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+h1,h2{font-family:var(--display);font-weight:600;text-wrap:balance;line-height:1.2;margin:0}
+h1{font-size:2.4rem} h2{font-size:1.6rem;margin-top:36px}
+h3{font-size:1.05rem;margin:8px 0 0}
+p,ul,ol{margin:0} li{margin-block:4px}
+.eyebrow{font:500 .75rem var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+.lede{font-size:1.15rem;color:var(--muted)}
+code,.mono{font-family:var(--mono);font-size:.88em}
+code{background:color-mix(in srgb,var(--accent) 10%,transparent);padding:1px 5px;border-radius:4px}
+a{color:var(--accent)}
+.bench{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;display:flex;flex-direction:column;gap:12px}
+.bench svg{width:100%;height:auto;display:block}
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 20px}
+.controls label{display:flex;flex-direction:column;font-size:.85rem;color:var(--muted)}
+.controls label b{color:var(--fg);font-family:var(--mono);font-weight:500}
+input[type=range]{accent-color:var(--accent);width:100%}
+.readout{display:flex;flex-wrap:wrap;gap:8px 24px;font-family:var(--mono);font-size:.9rem}
+.readout span b{font-size:1.3rem;color:var(--accent)}
+.note{border-left:3px solid var(--warm);padding:4px 0 4px 14px;color:var(--muted)}
+.mech{background:color-mix(in srgb,var(--accent) 7%,var(--panel));border-radius:8px;padding:12px 14px;font-size:.95rem}
+.mech b{color:var(--accent)}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.9rem;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-weight:600;color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}
+.tl{display:grid;grid-template-columns:110px 1fr;gap:6px 14px;font-size:.95rem}
+.tl .t{font-family:var(--mono);color:var(--accent)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:.82rem;color:var(--muted)}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+svg text{fill:var(--muted);font-family:var(--mono);font-size:11px}
+.btns{display:flex;flex-wrap:wrap;gap:6px}
+button{font:500 .85rem var(--body);border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;padding:6px 12px;cursor:pointer}
+button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:var(--panel)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--warm);outline-offset:2px}
+</style>
+
+<main>
+<div class="eyebrow">energy-price-predictor · DE-LU day-ahead</div>
+<h1>How a power price is set, and how this repo predicts it</h1>
+<p class="lede">Part 1 explains the market from first principles. Part 2 walks through the code: data, features, models, and how they are scored. Each idea gets an engineering analogy where one helps.</p>
+
+<h2>Part 1 · The market</h2>
+
+<h3>The product: energy for one quarter-hour, delivered tomorrow</h3>
+<p>Electricity can't be stored cheaply at grid scale, so supply must match demand every instant. Europe handles most of this with a daily auction called the <b>day-ahead market</b> (SDAC). Every day at <b>12:00 CET</b>, buyers and sellers submit bids for each delivery period of the <i>next</i> day. Since 1 October 2025 those periods are 15 minutes long, so each day has 96 separate prices. Your repo marks this switch with the feature <code>is_qh_era</code>.</p>
+
+<h3>The merit order: sort plants by running cost</h3>
+<p>Each generator offers its output at roughly its <b>marginal cost</b>: the cost of producing one more MWh. For wind and solar that is close to zero (no fuel). For a gas plant it is mostly fuel plus CO₂ permits. The exchange sorts all offers from cheapest to dearest, which gives a staircase supply curve. Where the staircase crosses demand is the <b>clearing price</b>, and <b>every</b> seller in that period gets paid that price ("pay-as-clear").</p>
+<div class="mech"><b>Analogy:</b> it is like a pump curve meeting a system curve. The operating point is wherever they intersect. Shift either curve and the operating point moves. Wind and solar shift the supply curve right; demand shifts the vertical line.</div>
+
+<div class="bench" id="merit">
+  <div class="controls">
+    <label for="m-hour">Hour of day <b id="m-hour-v"></b><input id="m-hour" type="range" min="0" max="23" value="18"></label>
+    <label for="m-wind">Wind output <b id="m-wind-v"></b><input id="m-wind" type="range" min="2" max="55" value="12"></label>
+    <label for="m-solarcap">Sunniness (solar peak) <b id="m-solar-v"></b><input id="m-solarcap" type="range" min="0" max="60" value="10"></label>
+    <label for="m-gas">Gas price <b id="m-gas-v"></b><input id="m-gas" type="range" min="10" max="150" value="35"></label>
+  </div>
+  <svg id="m-svg" viewBox="0 0 720 330" role="img" aria-label="Merit order supply curve with demand line and clearing price"></svg>
+  <div class="legend" id="m-legend"></div>
+  <div class="readout">
+    <span>Demand <b id="m-dem"></b></span>
+    <span>Residual load <b id="m-res"></b></span>
+    <span>Clearing price <b id="m-price"></b></span>
+    <span>Price-setter <b id="m-setter" style="font-size:1rem"></b></span>
+  </div>
+</div>
+<p class="note">Toy model of Germany with round numbers. Try: hour 13 with high sun (price collapses, sometimes below zero), hour 18 with low wind (gas sets the price), then raise gas to 120 €/MWh to see the 2022 crisis.</p>
+
+<h3>Residual load: the one number that explains most of the price</h3>
+<p><b>Residual load = demand − wind − solar.</b> It is the demand left over for the plants that cost money to run. Low residual load means the cheap part of the staircase is enough, so the price is low. High residual load pushes the crossing point up into gas and oil, so the price jumps. The staircase is steep at the top, which is why prices are spiky and non-linear. Your feature table builds this directly: <code>residual_load = load − wind − solar</code>.</p>
+
+<h3>Why prices go negative</h3>
+<p>When wind plus solar exceed demand, some generators still bid below zero: subsidised plants that earn per MWh produced, and inflexible plants for which shutting down and restarting costs more than paying someone to take power for a few hours. The model has to handle these negative values, which is why LEAR uses an <code>asinh</code> transform (see Part 2).</p>
+
+<h3>Neighbours and coupling</h3>
+<p>All European zones clear in one coupled algorithm, constrained by interconnector capacity. If France has cheap nuclear and the lines are not full, power flows to Germany and prices converge. If the lines are congested, prices split. Neighbour prices from yesterday are therefore a good hint about tomorrow's flows. Note the repo can only use neighbours' prices up to day D, because all zones publish D+1 at the same moment.</p>
+
+<h3>The daily timeline</h3>
+<div class="tl">
+  <span class="t">D, ~09:00</span><span>TSOs publish day-ahead load forecasts for D+1.</span>
+  <span class="t">D, 10:00</span><span><b>Your model's decision time</b> (<code>DECISION_HOUR = 10</code>). Forecast made with what is known now.</span>
+  <span class="t">D, 12:00</span><span>Gate closure. Bids locked.</span>
+  <span class="t">D, ~12:45</span><span>96 prices for D+1 published for every zone.</span>
+  <span class="t">D, 18–21:00</span><span>TSO wind/solar forecasts for D+1 appear on ENTSO-E (after gate closure, see caveat at the end).</span>
+  <span class="t">D+1</span><span>Delivery. Intraday and balancing markets fix the remaining errors.</span>
+</div>
+
+<h2>Part 2 · The predictor</h2>
+<p>The goal: at 10:00 on day D, predict all 96 quarter-hour prices of day D+1 in the <b>DE-LU</b> zone (Germany + Luxembourg). The pipeline is:</p>
+<div class="bench">
+<svg viewBox="0 0 720 120" role="img" aria-label="Pipeline diagram">
+  <g font-size="12">
+  <rect x="4" y="30" width="120" height="60" rx="6" fill="none" stroke="var(--line)"/><text x="64" y="56" text-anchor="middle" style="fill:var(--fg)">Rebase Grid API</text><text x="64" y="74" text-anchor="middle">data.py</text>
+  <rect x="152" y="30" width="120" height="60" rx="6" fill="none" stroke="var(--line)"/><text x="212" y="56" text-anchor="middle" style="fill:var(--fg)">15-min panel</text><text x="212" y="74" text-anchor="middle">parquet cache</text>
+  <rect x="300" y="30" width="120" height="60" rx="6" fill="none" stroke="var(--line)"/><text x="360" y="56" text-anchor="middle" style="fill:var(--fg)">Feature table</text><text x="360" y="74" text-anchor="middle">features.py</text>
+  <rect x="448" y="12" width="120" height="40" rx="6" fill="none" stroke="var(--accent)"/><text x="508" y="37" text-anchor="middle" style="fill:var(--fg)">LEAR</text>
+  <rect x="448" y="68" width="120" height="40" rx="6" fill="none" stroke="var(--accent)"/><text x="508" y="93" text-anchor="middle" style="fill:var(--fg)">LightGBM</text>
+  <rect x="596" y="30" width="120" height="60" rx="6" fill="none" stroke="var(--warm)"/><text x="656" y="56" text-anchor="middle" style="fill:var(--fg)">Ensemble</text><text x="656" y="74" text-anchor="middle">mean of the two</text>
+  <path d="M124 60H150M272 60H298M420 60L446 32M420 60L446 88M568 32L594 56M568 88L594 64" stroke="var(--muted)" fill="none" marker-end="url(#ar)"/>
+  <defs><marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L8 4L0 8z" fill="var(--muted)"/></marker></defs>
+  </g>
+</svg>
+</div>
+
+<h3>Step 1 · Data (<code>data.py</code>)</h3>
+<p>Every input is declared once in <code>REGISTRY</code> with an <b>availability rule</b>:</p>
+<div class="scroll"><table>
+<tr><th>Series</th><th>Source</th><th>Usable up to</th><th>Why it matters</th></tr>
+<tr><td>DE-LU day-ahead price</td><td>ENTSO-E</td><td>end of D</td><td>The target, and its own history</td></tr>
+<tr><td>Load forecast (ENTSO-E, SMARD fallback)</td><td>TSOs</td><td>end of D+1</td><td>Demand line in the merit order</td></tr>
+<tr><td>Wind on/offshore, solar forecasts</td><td>TSOs</td><td>end of D+1</td><td>Shift the supply staircase</td></tr>
+<tr><td>11 neighbour zone prices (FR, NL, BE, AT, CH, PL, CZ, DK1, DK2, NO2, SE4)</td><td>ENTSO-E</td><td>end of D</td><td>Cross-border flows</td></tr>
+</table></div>
+<p><code>mask_unavailable</code> blanks anything past its horizon, and a test checks features never depend on blanked values. This is the guard against <b>look-ahead leakage</b>: the most common way price models look great in backtest and fail live. Rebase's <code>knowledge_time</code> can't be trusted on history (it records backfill time), so the repo enforces the rules itself.</p>
+
+<h3>Step 2 · Features (<code>features.py</code>)</h3>
+<p>Every series is reshaped into a <b>day × slot matrix</b>: one row per local Berlin day, 96 columns for the quarter-hours. That makes "same quarter-hour yesterday" a simple row shift. Daylight-saving days (92 or 100 periods) are padded or averaged so every day has 96 slots. Each row of the final table is one (target day, slot) pair with about 60 features:</p>
+<div class="bench">
+  <div class="btns" id="f-btns"></div>
+  <svg id="f-svg" viewBox="0 0 720 210" role="img" aria-label="Day by slot grid showing which cells a feature group reads"></svg>
+  <p id="f-text" style="font-size:.95rem"></p>
+</div>
+
+<h3>Step 3 · Models (<code>models/</code>)</h3>
+<p><b>Benchmarks.</b> <code>naive</code> copies yesterday's prices (or last week's for Mon/Sat/Sun, where yesterday was a different kind of day). Any model must beat this to be worth anything. <code>seasonal_naive</code> always copies last week.</p>
+
+<p><b>LEAR</b> (<code>lear.py</code>, from Lago et al. 2021, the standard academic benchmark). It fits <b>96 separate linear regressions</b>, one per quarter-hour. Inputs are 199 hourly values: prices of D, D−1, D−2, D−6, tomorrow's load, wind, solar, today's residual load, and weekday dummies. Three tricks:</p>
+<ul>
+  <li><b>Lasso</b>: an L1 penalty pushes useless coefficients to exactly zero, so the model picks a few dozen inputs out of 199. The penalty strength is chosen by AIC.</li>
+  <li><b>Robust scaling + asinh</b>: each input is centred on its median and scaled by its MAD, then passed through <code>asinh</code>. asinh acts like a log for big values but passes smoothly through zero and works for negatives, so price spikes don't dominate the fit.</li>
+  <li><b>Window averaging</b>: it fits on the last 56, 84, 364 and 728 days and averages the four. Short windows react to new regimes; long ones are stable.</li>
+</ul>
+
+<p><b>LightGBM</b> (<code>gbm.py</code>). A single gradient-boosted tree model for all slots, with slot and hour as features. Each tree is a set of if/else splits ("residual load &gt; 45 GW and hour = 18 → +40 €"). 800 small trees are added one at a time, each correcting the errors of the ones before. Trees capture the kinked, staircase shape of the merit order that a linear model can't.</p>
+<ul>
+  <li><b>Objective <code>l1</code></b>: minimises absolute error, so a single crazy spike doesn't drag the whole model.</li>
+  <li><b>Recency weights</b>: a training day loses half its weight every 180 days (<code>half_life_days</code>), so 2022 gas-crisis behaviour fades.</li>
+  <li><b>Tuned hyperparameters</b> came from Optuna on a validation year (<code>scripts/tune_gbm.py</code> → <code>results/gbm_best_params.json</code>). It sees only 31% of features per tree and requires 635 rows per leaf, which keeps it from memorising noise.</li>
+  <li>The code can optionally predict <i>price minus yesterday's mean</i>, because trees can't extrapolate beyond prices they have seen. Tuning chose to switch this off (<code>relative_to_level: false</code>).</li>
+</ul>
+
+<p><b>Ensemble.</b> <code>forecast_tomorrow.py</code> averages LEAR and LightGBM. Their errors are only partly correlated (one linear, one tree-based), so the average is usually better than either.</p>
+
+<h3>Step 4 · Walk-forward backtest (<code>backtest.py</code>)</h3>
+<p>For each day from Nov 2024 to Oct 2026, the model is trained only on earlier days (refit weekly), then predicts that day. This mimics live use exactly. Results, mean absolute error in €/MWh:</p>
+<div class="bench">
+  <svg id="b-svg" viewBox="0 0 720 190" role="img" aria-label="Bar chart of model MAE"></svg>
+  <p style="font-size:.9rem;color:var(--muted)">rMAE = MAE ÷ naive MAE. GBM's 0.42 means it removes 58% of the naive error. Source: <code>results/metrics_2024-11-01_2026-10-31_*.csv</code>. A Diebold–Mariano test (<code>dm_test</code>) checks the gaps are statistically real, not luck.</p>
+</div>
+
+<h3>A real forecast: 5 November 2026</h3>
+<div class="bench">
+  <svg id="d-svg" viewBox="0 0 720 260" role="img" aria-label="Forecast versus actual price for 5 November 2026"></svg>
+  <div class="legend"><span><i style="background:var(--accent)"></i>Ensemble forecast</span><span><i style="background:var(--warm)"></i>Actual</span></div>
+  <p style="font-size:.9rem;color:var(--muted)">Values at the start of each hour, from <code>results/forecast_2026-11-05.csv</code>. The shape (morning and evening peaks, midday dip) is right. The evening peak came in ~25 €/MWh higher than predicted, a typical miss on a low-wind November evening.</p>
+</div>
+
+<h2>Caveats to keep in mind</h2>
+<ul>
+  <li><b>Wind/solar timing.</b> The backtest treats D+1 wind/solar forecasts as known at 10:00, but ENTSO-E publishes them after gate closure. Live, the script warns if they're missing. Backtest errors are therefore somewhat optimistic. Using a weather-based forecast available in the morning would fix this.</li>
+  <li><b>Regime changes.</b> Gas prices and CO₂ are not inputs. If gas doubles, the model only learns it through rising lagged prices, a day or more late.</li>
+  <li><b>Point forecast only.</b> For battery dispatch, the <i>shape</i> (peak-minus-trough spread) matters more than the level, and uncertainty bands would help. Quantile objectives in LightGBM are a natural next step.</li>
+</ul>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const NS="http://www.w3.org/2000/svg";
+function el(tag,attrs,parent,text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;parent&&parent.appendChild(e);return e}
+
+/* ---------- merit order ---------- */
+const demandProfile=[48,46,45,45,46,50,57,63,66,67,67,67,66,65,64,64,65,68,71,70,67,62,56,51];
+function solarShape(h){return Math.max(0,Math.sin(Math.PI*(h-6.5)/12.5))}
+function plants(gas){const co2=70;return[
+  {n:"Wind",cap:+$("m-wind").value,c:-5,col:"--wind"},
+  {n:"Solar",cap:+$("m-solarcap").value*solarShape(+$("m-hour").value),c:-3,col:"--solar"},
+  {n:"Nuclear-free baseload (hydro, biomass)",cap:9,c:8,col:"--accent"},
+  {n:"Lignite",cap:14,c:12+1.15*co2*0.5,col:"--muted"},
+  {n:"Hard coal",cap:12,c:25+0.85*co2*0.6+gas*0.25,col:"--muted"},
+  {n:"Gas CCGT",cap:22,c:gas/0.55+0.37*co2+4,col:"--warm"},
+  {n:"Gas peakers",cap:10,c:gas/0.36+0.55*co2+8,col:"--warm"},
+  {n:"Oil / demand response",cap:8,c:450,col:"--neg"}]}
+function drawMerit(){
+  const h=+$("m-hour").value,gas=+$("m-gas").value;
+  $("m-hour-v").textContent=String(h).padStart(2,"0")+":00";
+  $("m-wind-v").textContent=$("m-wind").value+" GW";
+  $("m-solar-v").textContent=$("m-solarcap").value+" GW peak";
+  $("m-gas-v").textContent=gas+" €/MWh";
+  const ps=plants(gas).filter(p=>p.cap>0.05).sort((a,b)=>a.c-b.c);
+  const dem=demandProfile[h];const svg=$("m-svg");svg.innerHTML="";
+  const X0=50,X1=700,Y0=290,Y1=20,maxGW=150,pMin=-50,pMax=500;
+  const x=g=>X0+(X1-X0)*g/maxGW, y=p=>Y0-(Y0-Y1)*(Math.min(p,pMax)-pMin)/(pMax-pMin);
+  for(const p of [0,100,200,300,400,500]){el("line",{x1:X0,x2:X1,y1:y(p),y2:y(p),stroke:css("--line")},svg);el("text",{x:X0-6,y:y(p)+4,"text-anchor":"end"},svg,p)}
+  for(const g of [0,25,50,75,100,125,150])el("text",{x:x(g),y:Y0+16,"text-anchor":"middle"},svg,g);
+  el("text",{x:X1,y:Y0+30,"text-anchor":"end"},svg,"cumulative capacity, GW");
+  el("text",{x:X0,y:12},svg,"€/MWh");
+  let cum=0,price=null,setter="";
+  for(const p of ps){const top=y(Math.max(p.c,0)),base=y(0);
+    el("rect",{x:x(cum),width:Math.max(0,x(cum+p.cap)-x(cum)-1),y:p.c>=0?top:base,height:Math.max(2,Math.abs(base-top)),fill:css(p.col),opacity:.85},svg);
+    if(price===null&&cum+p.cap>=dem){price=p.c;setter=p.n}cum+=p.cap}
+  if(price===null){price=3000;setter="Scarcity (not enough supply)"}
+  el("line",{x1:x(dem),x2:x(dem),y1:Y1,y2:Y0,stroke:css("--fg"),"stroke-width":2,"stroke-dasharray":"5 4"},svg);
+  el("text",{x:x(dem)+6,y:Y1+12,style:"fill:"+css("--fg")},svg,"demand "+dem+" GW");
+  el("line",{x1:X0,x2:X1,y1:y(price),y2:y(price),stroke:css("--accent"),"stroke-width":1.5},svg);
+  el("circle",{cx:x(dem),cy:y(price),r:6,fill:css("--accent")},svg);
+  const ren=+$("m-wind").value+ +$("m-solarcap").value*solarShape(h);
+  $("m-dem").textContent=dem+" GW";$("m-res").textContent=(dem-ren).toFixed(0)+" GW";
+  $("m-price").textContent=price.toFixed(0)+" €/MWh";$("m-price").style.color=price<0?css("--neg"):"";
+  $("m-setter").textContent=setter;
+}
+$("m-legend").innerHTML=[["--wind","Wind"],["--solar","Solar"],["--accent","Hydro / biomass"],["--muted","Coal & lignite"],["--warm","Gas"],["--neg","Oil / demand response"]].map(([c,n])=>`<span><i style="background:var(${c})"></i>${n}</span>`).join("");
+["m-hour","m-wind","m-solarcap","m-gas"].forEach(i=>$(i).addEventListener("input",drawMerit));
+
+/* ---------- feature grid ---------- */
+const groups={
+ "Price lags":{cells:[[1,"s"],[2,"s"],[3,"s"],[7,"s"]],src:"price",t:"<code>price_lag1/2/3/7</code>: the price at the <b>same quarter-hour</b> 1, 2, 3 and 7 days before the target. Tomorrow at 18:00 looks a lot like today at 18:00 and last week's same weekday at 18:00."},
+ "Day-D summary":{cells:[[1,"row"],[7,"row"]],src:"price",t:"<code>price_d_mean/min/max/std/last</code> describe the whole of today's price curve: level, range and volatility. <code>price_d6_mean</code> is the mean a week earlier. These set the overall level that tomorrow will start from."},
+ "Fundamentals for T":{cells:[[0,"row"]],src:"fc",t:"<code>load, solar, wind_on, wind_off, residual_load, renewable_share</code> for the target day itself, slot by slot, plus daily sums and peaks. This is the merit-order physics: these are the strongest predictors of how tomorrow differs from today. <code>residual_vs_d</code> is the change versus today; <code>residual_ramp_1h</code> catches steep evening ramps."},
+ "Neighbours":{cells:[[1,"s"],[1,"row"]],src:"nb",t:"For each of 11 neighbouring zones: today's price at the same slot (<code>price_fr_lag1</code>, …) and the gap between their daily mean and Germany's (<code>spread_fr_d_mean</code>, …). Big spreads hint at congested interconnectors."},
+ "Calendar":{cells:[[0,"cal"]],src:"cal",t:"<code>dow, month, doy_sin/cos, is_holiday, holiday_state_share, is_bridge, is_christmas, slot, hour</code>. Demand drops on Sundays and holidays; <code>holiday_state_share</code> handles regional German holidays (e.g. only Bavaria); bridge days catch the Friday after Ascension."}};
+let active="Price lags";
+const fb=$("f-btns");
+Object.keys(groups).forEach(k=>{const b=document.createElement("button");b.textContent=k;b.onclick=()=>{active=k;drawGrid()};fb.appendChild(b)});
+function drawGrid(){
+  [...fb.children].forEach(b=>b.setAttribute("aria-pressed",b.textContent===active));
+  const g=groups[active],svg=$("f-svg");svg.innerHTML="";
+  const labels=["T (target)","D = T−1","T−2","T−3","T−4","T−5","T−6","T−7"];
+  const X0=110,W=560/24,H=21,slot=18;
+  labels.forEach((l,r)=>{el("text",{x:X0-8,y:20+r*H+15,"text-anchor":"end",style:r===0?"fill:"+css("--fg"):""},svg,l);
+    for(let c=0;c<24;c++){
+      let on=g.cells.some(([rr,m])=>rr===r&&(m==="row"||(m==="s"&&c===slot)));
+      const isTarget=r===0&&c===slot;
+      const unknown=g.src!=="fc"&&g.src!=="cal"&&r===0;
+      let fill=css("--bg");if(on)fill=g.src==="fc"?css("--wind"):g.src==="cal"?css("--muted"):css("--accent");
+      if(g.src==="cal"&&r===0)fill=css("--muted");
+      el("rect",{x:X0+c*W,y:20+r*H,width:W-2,height:H-3,rx:2,fill,opacity:on||(g.src==="cal"&&r===0)?.8:1,stroke:isTarget?css("--warm"):css("--line"),"stroke-width":isTarget?2.5:1},svg);
+      if(unknown&&!isTarget&&c%6===2)el("text",{x:X0+c*W+W/2,y:20+15,"text-anchor":"middle"},svg,"?");
+    }});
+  for(const c of [0,6,12,18])el("text",{x:X0+c*W,y:14},svg,String(c).padStart(2,"0")+":00");
+  el("text",{x:X0+slot*W+W/2,y:205,"text-anchor":"middle",style:"fill:"+css("--warm")},svg,"▲ row being predicted (18:00)");
+  $("f-text").innerHTML=g.t+(g.src==="price"||g.src==="nb"?" <i>Prices for T are unknown at decision time, so the top row stays blank.</i>":"");
+}
+/* (grid drawn hourly for legibility; the code uses 96 quarter-hour columns) */
+
+/* ---------- metrics bars ---------- */
+function drawBars(){
+  const d=[["seasonal_naive",38.84,1.19],["naive",32.63,1.00],["LEAR",17.22,0.53],["LightGBM (tuned)",13.79,0.42]];
+  const svg=$("b-svg");svg.innerHTML="";const X0=150,X1=640,sc=v=>(X1-X0)*v/40;
+  for(const v of [0,10,20,30,40]){el("line",{x1:X0+sc(v),x2:X0+sc(v),y1:10,y2:165,stroke:css("--line")},svg);el("text",{x:X0+sc(v),y:182,"text-anchor":"middle"},svg,v)}
+  d.forEach(([n,v,r],i)=>{const yy=18+i*38;
+    el("text",{x:X0-8,y:yy+17,"text-anchor":"end",style:"fill:"+css("--fg")},svg,n);
+    el("rect",{x:X0,y:yy,width:sc(v),height:24,rx:3,fill:i>1?css("--accent"):css("--muted")},svg);
+    el("text",{x:X0+sc(v)+6,y:yy+17},svg,v.toFixed(1)+" €/MWh · rMAE "+r.toFixed(2))});
+}
+
+/* ---------- 5 Nov forecast ---------- */
+function drawDay(){
+  const f=[200,213,208,207,204,200,208,285,307,278,237,208,192,195,211,233,285,326,326,320,297,273,249,234];
+  const a=[203,196,208,205,207,207,204,276,313,284,248,210,204,209,201,248,302,353,349,349,332,308,284,259];
+  const svg=$("d-svg");svg.innerHTML="";const X0=50,X1=700,Y0=225,Y1=15,lo=150,hi=375;
+  const x=h=>X0+(X1-X0)*h/23,y=v=>Y0-(Y0-Y1)*(v-lo)/(hi-lo);
+  for(const v of [150,200,250,300,350]){el("line",{x1:X0,x2:X1,y1:y(v),y2:y(v),stroke:css("--line")},svg);el("text",{x:X0-6,y:y(v)+4,"text-anchor":"end"},svg,v)}
+  for(const h of [0,6,12,18,23])el("text",{x:x(h),y:Y0+18,"text-anchor":"middle"},svg,String(h).padStart(2,"0")+":00");
+  el("text",{x:X0,y:10},svg,"€/MWh");
+  const line=(arr,col,w)=>el("polyline",{points:arr.map((v,h)=>x(h)+","+y(v)).join(" "),fill:"none",stroke:css(col),"stroke-width":w,"stroke-linejoin":"round"},svg);
+  line(a,"--warm",2.5);line(f,"--accent",2.5);
+}
+
+function drawAll(){drawMerit();drawGrid();drawBars();drawDay()}
+drawAll();
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change",drawAll);
+new MutationObserver(drawAll).observe(document.documentElement,{attributes:true,attributeFilter:["data-theme"]});
+</script>
